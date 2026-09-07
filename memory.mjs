@@ -47,7 +47,7 @@ export async function syncMemory(phone, scope, userName, isCurrent, save) {
   const memory = ensureWorld(phone).world.memory;
   const rows = memoryRecords(phone,userName);
   const pending = rows.filter(r => memory.written[r.id] !== hash(formatMemory(r)));
-  if (!pending.length) return;
+  if (!pending.length) {memory.status=rows.length?`Anima 已写入 ${Object.keys(memory.written).length} 条记录；当前无待写入内容`:'尚无可写入的手机或幕后记录';save();return;}
   try {
     const { callBackend } = await animaModule('db_api');
     if (!isCurrent()) return;

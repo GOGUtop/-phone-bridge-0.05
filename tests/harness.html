@@ -25,13 +25,17 @@
       chatId: 'ui-harness', characterId: 0, name1: '阿遥', name2: '林澈',
       characters: [{ name: '林澈', avatar: 'lin.png', description: '冷静但很守时。', personality: '克制、认真', scenario: '两人生活在现代城市。', data: { extensions: { anima_prompt_config: [{ role: 'system', title: '状态占位符', content: '{{status}}' }, { role: 'user', title: '增量剧情', content: '{{chat_context}}' }] } } }],
       chat:chatRows, extensionSettings: {}, chatMetadata: {},
+      substituteParams(text){return String(text).replaceAll('{{user}}',this.name1).replaceAll('{{char}}',this.name2);},
+      getPresetManager(){return {getPresetList:()=>({preset_names:{'测试写作预设':0},presets:[window.testPreset]}),getCompletionPresetByName:()=>window.testPreset,getSelectedPresetName:()=> '测试写作预设'};},
+      getCharacterCardFields(){return {description:'冷静但很守时。',personality:'克制、认真',scenario:'现代城市。',persona:'阿遥'};},
       saveMetadataDebounced(){}, async saveMetadata(){},
       setExtensionPrompt(name,text){(window.injectedPrompts||={})[name]=text;},
       saveSettingsDebounced() {}, getRequestHeaders() { return {}; },
       async writeExtensionField(characterId, key, value) { this.characters[characterId].data.extensions[key] = value; },
-      eventSource: { on(name, fn) { (eventHandlers[name] ||= []).push(fn); }, emit() {} },
+      eventSource: { on(name, fn) { (eventHandlers[name] ||= []).push(fn); }, removeListener(name,fn){eventHandlers[name]=(eventHandlers[name]||[]).filter(f=>f!==fn);}, emit(name,...args) {for(const fn of [...eventHandlers[name]||[]])fn(...args);} },
     };
     window.SillyTavern = { getContext: () => ctx };
+    window.testPreset={prompts:[{identifier:'main',name:'主提示',role:'system',content:'PRESET_SENTINEL 清晰动作与对白。'},{identifier:'chatHistory',name:'历史',marker:true},{identifier:'style',name:'文风',role:'system',content:'克制'}],prompt_order:[{character_id:100001,order:[{identifier:'main',enabled:true},{identifier:'chatHistory',enabled:true},{identifier:'style',enabled:false}]}]};
     window.harness={ctx,chatRows,variables,eventHandlers,calls:[]};
     window.TavernHelper = {
       getPresetNames(){return ['测试写作预设'];},
@@ -74,6 +78,8 @@
         body.models = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gpt-4.1-mini'];
       } else if (route === '/test') {
         body.content = '{"reply":"连接成功"}';
+      } else if(route==='/generate') {
+        body.content='<PersonaVoice>你是一位温和、说话干脆的伙伴。</PersonaVoice><PersonaExample>示例答：我听着，你接着说。</PersonaExample>';
       } else if(route==='/roster') {
         body.content=JSON.stringify({people:[{name:'周宁',evidence:'周宁是阿遥的朋友。',relationToUser:'朋友',known:true}]});
       } else if(route==='/json') {
@@ -89,6 +95,8 @@
             requests:[{id:'friend-li',type:'friend',name:'李遥',source:'朋友推荐',text:'我是隔壁小组的李遥'}],
             sms:[{id:'sms-delivery',sender:'快递服务',text:'快递已放到驿站'}],
             orderUpdates: [], commitmentUpdates: [], incomingMessages: [], walletChanges: [], moments: [],
+            voices:[{name:'林澈',content:'说好了五点，不能迟到。'}],
+            roundReview:{offscreen:{checked:true,reason:'周宁在公司收尾工作'},world:{checked:true,reason:'外部事件暂无新进展'},voices:{checked:true,reason:'林澈等待赴约'}},
             backstage: {
               timeline: { date: '2026/09/07', time: '16:45', location: '桥下咖啡', weather: '晴' },
               present: [{ name: '林澈', action: '在门口等候', mood: '平静' }],
