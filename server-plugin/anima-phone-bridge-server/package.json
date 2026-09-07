@@ -1,0 +1,8 @@
+{
+  "name": "anima-phone-bridge-server",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.mjs",
+  "description": "Server-side dual API proxy, automatic fallback, and model discovery for Anima Phone Bridge"
+}
