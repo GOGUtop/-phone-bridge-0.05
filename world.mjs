@@ -33,7 +33,7 @@ export function extractPeople(entries, userName = '') {
       people.set(name, { name, aliases: [], evidence: clean(evidence, 500), identity: clean(entry.comment || entry.name, 120), relationToUser: relation, known: Boolean(relation), source: '世界书证据' });
     };
     for (const m of body.matchAll(/(?:姓名|名字|人物名|角色名|name)\s*["']?\s*[:：]\s*["']?([^\n,，;；。"']{2,40})/gi)) add(m[1], m[0], /(?:与|是)\s*(?:\{\{user\}\}|用户|玩家)\s*(?:的)?\s*(家人|朋友|同学|同事|父亲|母亲|兄弟|姐妹|上司)/.exec(body)?.[1] || '');
-    for (const m of body.matchAll(/(?:同学|同事|父亲|母亲|朋友|上司|妹妹|姐姐|哥哥|弟弟)\s*(?:名叫|叫做|叫|：|:)?\s*([\u3400-\u9fff]{2,4})(?=[，。；\s]|$)/g)) add(m[1], m[0]);
+    for (const m of body.matchAll(/(?:同学|同事|父亲|母亲|朋友|上司|妹妹|姐姐|哥哥|弟弟)\s*(?:名叫|叫做|叫|：|:)\s*([\u3400-\u9fff]{2,4})(?=[，。；\s]|$)/g)) add(m[1], m[0]);
     const title = clean(entry.comment || entry.name).replace(/^(人物|角色|NPC)\s*[:：]\s*/i, '');
     const evidenceCount = [...body.matchAll(/(?:年龄|性别|职业|性格|外貌|身份)\s*[:：]/g)].length;
     if (evidenceCount >= 4) add(title, body.slice(0, 500));
@@ -236,7 +236,7 @@ export function applyWorldDelta(phone, payload, meta = {}) {
     const rows = (payload[key] || []).filter(r => r && typeof r === 'object' && !(key === 'diaries' && r.name === user));
     const enriched = rows.map(r => ({ ...r, id: r.id || (['wardrobe','anniversaries','knowledge'].includes(key) ? `${key}-${hash(r.name + '|' + (r.item || r.title || r.fact))}` : `${meta.signature}-${key}-${n++}`), floor: meta.messageId, time: Date.now() }));
     if(key==='wardrobe')for(const old of state.world.wardrobe)if(enriched.some(r=>r.name===old.name&&r.wearing&&r.item!==old.item))old.wearing=false;
-    state.world[key] = key === 'voices' ? enriched : mergeRecords(state.world[key], enriched, r => r.id);
+    if(key!=='voices'||Object.hasOwn(payload,'voices')&&payload.voices!==undefined)state.world[key] = key === 'voices' ? enriched : mergeRecords(state.world[key], enriched, r => r.id);
     for (const row of enriched) {
       const knownBy=['voices','diaries','npcPhones'].includes(key)?[row.name,...(Array.isArray(row.knownBy)?row.knownBy:[])]:row.knownBy?.length?row.knownBy:row.participants||[user,row.name];
       logWorld(state,key,JSON.stringify(row),knownBy,`${row.id}-${hash(JSON.stringify(row))}`);
@@ -249,7 +249,7 @@ export function applyWorldDelta(phone, payload, meta = {}) {
 export function worldSnapshot(phone, userName = '') {
   const state = ensureWorld(phone);
   const conversations = [...Object.values(state.threads), ...Object.values(state.groups)].filter(t=>t.messages.length).sort((a,b)=>b.messages.at(-1).time-a.messages.at(-1).time).slice(0,12).map(t=>({id:t.id,name:t.name,members:t.members,messages:t.messages.slice(-8)}));
-  return { userName, conversations, commitments:Object.values(state.commitments), recentEvents:state.world.journal.slice(-20), contacts: Object.values(state.contacts).filter(p=>!p.archived).map(({id,name,aliases})=>({id,name,aliases})), groups: Object.values(state.groups).map(({id,name,members}) => ({id,name,members})), wallet: {wechat:state.wallet.wechat,alipay:state.wallet.alipay,bank:state.wallet.bank,transactions:state.wallet.transactions.slice(-15)}, orders: [...state.delivery.orders, ...state.world.orders].slice(-20).map(({messages,...o})=>o), packets: state.world.packets.filter(p => p.remaining > 0).slice(-20), moments: state.moments.slice(-10), backstage: state.backstage, voices: state.world.voices, diaries: state.world.diaries.slice(-10), wardrobe: state.world.wardrobe.slice(-60), anniversaries: state.world.anniversaries, knowledge: state.world.knowledge.slice(-30), npcPhones: state.world.npcPhones.slice(-10) };
+  return { roundReview:state.world.roundReview, userName, conversations, commitments:Object.values(state.commitments), recentEvents:state.world.journal.slice(-20), contacts: Object.values(state.contacts).filter(p=>!p.archived).map(({id,name,aliases})=>({id,name,aliases})), groups: Object.values(state.groups).map(({id,name,members}) => ({id,name,members})), wallet: {wechat:state.wallet.wechat,alipay:state.wallet.alipay,bank:state.wallet.bank,transactions:state.wallet.transactions.slice(-15)}, orders: [...state.delivery.orders, ...state.world.orders].slice(-20).map(({messages,...o})=>o), packets: state.world.packets.filter(p => p.remaining > 0).slice(-20), moments: state.moments.slice(-10), backstage: state.backstage, voices: state.world.voices, diaries: state.world.diaries.slice(-10), wardrobe: state.world.wardrobe.slice(-60), anniversaries: state.world.anniversaries, knowledge: state.world.knowledge.slice(-30), npcPhones: state.world.npcPhones.slice(-10) };
 }
 export function worldPrompt() {
   return `你负责当前故事的手机和幕后生活。只输出合法JSON对象。每轮只新增本轮事件，不重复总结旧事件。正文已发生事实优先；没有明确结果的计划不能提前完成。NPC具有自己的人设、目标、日程和知情范围；允许零条或多条自主通讯与朋友圈，但不要机械刷屏。禁止替用户发消息、发朋友圈、接受邀请或写日记。

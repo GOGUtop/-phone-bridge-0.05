@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const PLUGIN_ID = 'anima-phone-bridge-server';
-const VERSION = '0.4.0';
+const VERSION = '0.6.0';
 const DATA_ROOT = path.resolve(globalThis.DATA_ROOT || path.join(process.cwd(), 'data'));
 const ROOT_DIR = path.basename(DATA_ROOT) === 'default-user'
   ? path.join(DATA_ROOT, 'anima-phone-bridge')
@@ -280,6 +280,7 @@ export async function init(router) {
   router.post('/generate', async (req, res) => {
     try {
       const config = loadConfig();
+      if(Number.isFinite(Number(req.body?.maxTokens)))config.send.maxTokens=Math.max(128,Math.min(16000,Number(req.body.maxTokens)));
       const result = await callSlot(config, 'send', safeMessages(req.body?.messages));
       res.json({ ok: true, provider: 'send', ...result });
     } catch (error) { res.status(400).json({ ok: false, error: String(error?.message || error) }); }

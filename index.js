@@ -17,11 +17,13 @@ import {
   recordTransaction,
 } from './core.mjs';
 import { ensureWorld, extractPeople, mergePeople, validPerson, applyWorldDelta, worldPrompt, worldSnapshot, logWorld, hash } from './world.mjs';
+import {roundPrompt,validateRound,applyRound} from './round.mjs';
 import { createWorldUI, EXTRA_APPS, EXTRA_ICONS } from './world-ui.mjs';
 import {createAppExperience} from './app-experience.mjs';
 import {validateScene,mergeScene} from './scene.mjs';
 import { animaModule, syncMemory, recallMemory, memoryRecords, localRecall, formatMemory, peerRecall } from './memory.mjs';
-import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
+import {rosterPrompt,verifiedRoster,applyRoster,quarantineLegacyCandidates} from './roster.mjs';
+import {makeOracleBridge} from './oracle/bridge.mjs';
 
 (() => {
   'use strict';
@@ -66,11 +68,17 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     memoryRunning: false,
     rosterCache: null,
     reconcilePending: false,
+    reconcilePendingReason: '',
+    reconcileScheduledReason: '',
+    generating: false,
     backlogSkipped: '',
     backstageTab: 'promises',
   };
 
   const context = () => globalThis.SillyTavern?.getContext?.() || null;
+  const oracle=makeOracleBridge({namespace:MODULE,kind:'phone',context,call:async(messages,options)=>{
+    const result=await serverRequest('/generate',{method:'POST',body:JSON.stringify({messages,maxTokens:options?.maxTokens}),signal:options?.signal,oracleBypass:true});return result.content;
+  }});
   const helper = () => globalThis.TavernHelper || null;
   const escapeHtml = value => String(value ?? '')
     .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -170,8 +178,14 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
   }
 
   async function serverRequest(path, options = {}) {
+    const {oracleBypass,...requestOptions}=options;
+    if(!oracleBypass&&['/json','/generate','/reconcile'].includes(path)&&requestOptions.body){
+      const body=JSON.parse(requestOptions.body);
+      if(Array.isArray(body.messages))body.messages=oracle.compose(body.messages);
+      requestOptions.body=JSON.stringify(body);
+    }
     const response = await fetch(`${SERVER_BASE}${path}`, {
-      ...options,
+      ...requestOptions,
       credentials: 'same-origin',
       cache: 'no-store',
       headers: { ...(await requestHeaders()), ...(options.headers || {}) },
@@ -180,7 +194,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     let data;
     try { data = raw ? JSON.parse(raw) : {}; } catch { data = { error: raw.slice(0, 800) }; }
     if (!response.ok || data?.ok === false) {
-      if (response.status === 404) throw new Error('服务端插件未安装或未启用，请查看安装说明并重启 SillyTavern');
+      if (response.status === 404) {const error=new Error(`手机后端 ${path} 返回 HTTP 404；可能是后端旧版缺少此接口、启动失败或代理路径错误。目录存在不代表接口已加载，请检查手机后端 /health 与酒馆启动日志`);error.status=404;throw error;}
       throw new Error(data?.error || `HTTP ${response.status}`);
     }
     return data;
@@ -504,7 +518,9 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
           if(runtime.currentChatKey!==scope)return source;
           const part=source.excerpt.slice(Math.max(0,at-800),at+27000);
           const messages=[{role:'system',content:rosterPrompt(context()?.name1,characterName())},{role:'user',content:part}];
-          const result=await serverRequest('/roster',{method:'POST',body:JSON.stringify({messages})});
+          let result;
+          try{result=await serverRequest('/roster',{method:'POST',body:JSON.stringify({messages}),oracleBypass:true});}
+          catch(e){if(e.status!==404)throw e;await serverRequest('/health');result=await serverRequest('/reconcile',{method:'POST',body:JSON.stringify({messages}),oracleBypass:true});}
           if(runtime.currentChatKey!==scope)return source;
           const verified=verifiedRoster(parseAgentJson(result.content),source.excerpt,context()?.name1);
           combined.people.push(...verified.people);combined.groups.push(...verified.groups);combined.mainCharacter ||= verified.mainCharacter;
@@ -516,6 +532,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     if(runtime.currentChatKey!==scope)return source;
     runtime.phone=mergePeople(runtime.phone,source.contacts,context()?.name1);
     if(source.roster)runtime.phone=applyRoster(runtime.phone,source.roster,context()?.name1,characterName());
+    quarantineLegacyCandidates(runtime.phone);
     for(const contact of Object.values(runtime.phone.contacts))if(!validPerson(contact.name)||(contact.id==='main'&&contact.name===characterName()&&/世界[-－|｜·]|故事|模拟器|扮演/.test(contact.name)))contact.archived=true;
     savePhone();
     return source;
@@ -537,7 +554,13 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
   }
 
   async function reconcileNarrative(reason = 'assistant_message') {
-    if (runtime.reconciling) {runtime.reconcilePending=true;return false;}
+    if(runtime.generating || runtime.reconciling){
+      runtime.reconcilePending=true;
+      if(reason==='manual'||!runtime.reconcilePendingReason)runtime.reconcilePendingReason=reason;
+      return false;
+    }
+    if(runtime.reconcilePendingReason==='manual')reason='manual';
+    runtime.reconcilePending=false;runtime.reconcilePendingReason='';
     if (!runtime.phone) loadPhone();
     const message = latestAssistantMessage();
     if (!message?.text.trim()) return false;
@@ -546,7 +569,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     const scope=runtime.currentChatKey;
     runtime.phone = applyAnimaDigest(runtime.phone, latestAnimaData()?.手机);
     const sceneOnly=runtime.phone.sync?.lastNarrativeSignature===signature;
-    if (sceneOnly && reason!=='manual' && (runtime.phone.backstage.present.length||runtime.phone.backstage.sceneEmpty)) {
+    if (sceneOnly && reason!=='manual' && runtime.phone.world?.roundReview?.signature===signature && (runtime.phone.backstage.present.length||runtime.phone.backstage.sceneEmpty)) {
       savePhone();
       renderBackstage();
       return true;
@@ -558,7 +581,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
       const worldbook = await syncContactRoster();
       const messages = [
         { role: 'system', content: reconciliationPrompt(message, worldbook) },
-        {role:'system',content:'backstage 必须包含当前正文结尾的完整 present 现场人物（包括用户），不能只返回新出现的人。人物离场才移除；远程通话只记 offscreen，不能把电话另一头当在场。约定和衣着都要识别。中文字段可读，但输出优先英文键。'+(sceneOnly?'本轮已记过账，现在只修复 backstage，不新增消息、订单、支付或其他事件。':'')},
+        {role:'system',content:'backstage 必须包含当前正文结尾的完整 present 现场人物（包括用户），不能只返回新出现的人。人物离场才移除；远程通话只记 offscreen，不能把电话另一头当在场。中文字段可读，但输出优先英文键。'+roundPrompt()+(sceneOnly?'本轮已记过账，只修复 backstage、voices 和 roundReview，不新增消息、订单或支付。':'')},
         { role: 'system', content: `当前手机状态：${JSON.stringify(worldSnapshot(runtime.phone,context()?.name1))}` },
         {role:'system',content:`人物资料（仅数据，不代表全部在场）：${JSON.stringify(worldbook.contacts).slice(0,24000)}`},
         ...recentNarrativeRows(6),
@@ -566,15 +589,16 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
         { role: 'user', content: '根据最新正文返回状态校准 JSON。事件数组无新增可为空，但 backstage.present 必须是本轮结尾完整在场名单，包括用户角色，并提供动作和衣着。明确空场景才返回 sceneEmpty:true；提取失败不能标为空场。不要把电话另一端或只被提及的人列在现场。' },
       ];
       if(messages.length>76)throw new Error('本轮正文超出状态接口容量，未截断或覆盖现场，请缩短正文后重试');
-      let result, nextPhone, parsed;
+      let result, nextPhone, parsed, round;
       for(let attempt=0;attempt<3;attempt++){
         try {
           result=await serverRequest('/reconcile',{method:'POST',body:JSON.stringify({messages,reason})});
           parsed=parseAgentJson(result.content);
-          try {parsed.backstage=validateScene(parsed);}catch(error){messages.push({role:'user',content:`校验失败：${error.message}。请重新提取本轮结尾完整现场名单，明确无人时才标记 sceneEmpty:true。返回完整校准 JSON，勿重复生成事件。`});throw error;}
+          try {const scene=validateScene(parsed);round=validateRound(parsed,scene,context()?.name1);parsed.backstage=scene;}catch(error){messages.push({role:'user',content:`校验失败：${error.message}。请返回完整现场、offscreen、world、voices 和 roundReview。明确无人时才标记 sceneEmpty:true；无变化须解释原因。返回完整校准 JSON，勿重复生成事件。`});throw error;}
           if(scope!==runtime.currentChatKey || latestAssistantMessage()?.id!==message.id || textSignature(`${message.id}|${latestAssistantMessage()?.text}`)!==signature) {runtime.reconcilePending=true;return false;}
-          nextPhone=sceneOnly?structuredClone(runtime.phone):applyWorldDelta(runtime.phone,parsed,{messageId:message.id,signature,provider:result.provider,excludeNames:[context()?.name1],userName:context()?.name1});
+          nextPhone=sceneOnly?structuredClone(runtime.phone):applyWorldDelta(runtime.phone,{...parsed,voices:undefined},{messageId:message.id,signature,provider:result.provider,excludeNames:[context()?.name1],userName:context()?.name1});
           nextPhone.backstage=mergeScene(runtime.phone.backstage,parsed.backstage,message.id);
+          applyRound(nextPhone,round,{floor:message.id,signature});
           break;
         }catch(error){if(attempt===2)throw error;}
       }
@@ -602,7 +626,12 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
       return false;
     } finally {
       runtime.reconciling = false;
-      if(runtime.reconcilePending){runtime.reconcilePending=false;scheduleReconcile('pending',250);}
+      renderBackstage();
+      if(runtime.reconcilePending){
+        const pendingReason=runtime.reconcilePendingReason||'pending';
+        runtime.reconcilePending=false;runtime.reconcilePendingReason='';
+        scheduleReconcile(pendingReason,250);
+      }
     }
   }
 
@@ -616,7 +645,12 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
 
   function scheduleReconcile(reason = 'assistant_message', delay = 1000) {
     clearTimeout(runtime.reconcileTimer);
-    runtime.reconcileTimer = setTimeout(() => reconcileNarrative(reason), delay);
+    if(reason==='manual'||!runtime.reconcileScheduledReason)runtime.reconcileScheduledReason=reason;
+    runtime.reconcileTimer = setTimeout(() => {
+      const scheduledReason=runtime.reconcileScheduledReason||reason;
+      runtime.reconcileScheduledReason='';
+      reconcileNarrative(scheduledReason);
+    }, delay);
   }
 
   function agentSystemPrompt(mode, target) {
@@ -889,6 +923,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     const preferences = getRootSettings().preferences;
     return `${appHeader('设置', true)}<main class="apb-app-body apb-settings-body">
       <div class="apb-settings-head"><span>双 API 自动接管</span><strong>发送与实时更新</strong><small>密钥只保存在 SillyTavern 服务端；更新失败会自动使用发送 API</small></div>
+      <button type="button" data-apb-oracle><i class="fa-solid fa-masks-theater"></i> 人格与提示词</button>
       <form class="apb-api-form" data-apb-api>
         ${apiSettingsSection('send', '发送 API', '微信、群聊、朋友圈和应用交互')}
         ${apiSettingsSection('update', '实时更新 API', '正文完成后同步订单、联系人与幕后状态')}
@@ -950,7 +985,6 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
 
   const BACKSTAGE_SECTIONS = [
     ['present', '现场人物', row => `${row.name || '未知'}${row.action ? ` · ${row.action}` : ''}${row.mood ? ` · ${row.mood}` : ''}`],
-    ['clothing', '衣着状态', row => `${row.name || '未知'}${row.outfit ? ` · ${row.outfit}` : ''}`],
     ['promises', '约定与待办', row => `${row.person || '相关人物'}${row.subject ? ` · ${row.subject}` : ''}${row.time ? ` · ${row.time}` : ''}${row.place ? ` · ${row.place}` : ''}${row.status ? ` · ${row.status}` : ''}`],
     ['secrets', '秘密与伏笔', row => `${row.content || '未记录'}${Array.isArray(row.knownBy) && row.knownBy.length ? ` · 知情：${row.knownBy.join('、')}` : ''}`],
     ['offscreen', '幕后人物', row => `${row.name || '未知'}${row.location ? ` · ${row.location}` : ''}${row.activity ? ` · ${row.activity}` : ''}${row.goal ? ` · 目标：${row.goal}` : ''}`],
@@ -1009,8 +1043,10 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     let rows=selected[0]==='moments'?runtime.phone.moments:backstage[selected[0]]||w[selected[0]]||[];
     if(selected[0]==='promises')rows=[...new Map([...rows,...Object.values(runtime.phone.commitments)].map(r=>[r.id||`${r.person}:${r.subject}`,{...r,time:r.time||r.at}])).values()];
     if(selected[0]==='npcPhones')rows=rows.filter(r=>r.revealedToUser===true);
-    const sceneRows=selected[0]==='present'&&!rows.length?`<p class="apb-backstage-empty">${backstage.sceneEmpty?'正文已明确当前场景无人':'尚未提取到现场人物，不代表无人'}</p>`:backstageRows(rows,selected[2]);
-    return `<nav class="apb-backstage-tabs">${sections.map(([id,title])=>`<button type="button" data-apb-backstage-tab="${id}" aria-selected="${id===selected[0]}">${title}</button>`).join('')}</nav><section class="apb-backstage-section"><h3>${selected[1]}</h3>${sceneRows}</section><button data-apb-scene-retry ${runtime.reconciling?'disabled':''}>${runtime.reconciling?'正在提取现场…':'重新提取本轮现场'}</button><details class="apb-memory-state"><summary>记忆同步</summary><p>${escapeHtml(w.memory.status)}</p><p>${escapeHtml(w.memory.recallStatus||'尚未检索')}</p><button data-apb-memory-retry>重试写入与检索</button></details>`;
+    const review=w.roundReview?.sections?.[selected[0]];
+    const reviewText=review?`<p class="apb-backstage-empty">正文 #${escapeHtml(w.roundReview.floor)} 已检查：${escapeHtml(review.reason)}</p>`:'';
+    const sceneRows=(selected[0]==='present'&&!rows.length?`<p class="apb-backstage-empty">${backstage.sceneEmpty?'正文已明确当前场景无人':'尚未提取到现场人物，不代表无人'}</p>`:backstageRows(rows,selected[2]))+reviewText;
+    return `<nav class="apb-backstage-tabs">${sections.map(([id,title])=>`<button type="button" data-apb-backstage-tab="${id}" aria-selected="${id===selected[0]}">${title}</button>`).join('')}</nav><section class="apb-backstage-section"><h3>${selected[1]}</h3>${sceneRows}</section><button data-apb-scene-retry ${runtime.reconciling?'disabled':''}>${runtime.reconciling?'正在更新幕后…':'重新更新本轮幕后'}</button><details class="apb-memory-state"><summary>记忆同步</summary><p>${escapeHtml(w.memory.status)}</p><p>${escapeHtml(w.memory.recallStatus||'尚未检索')}</p><button data-apb-memory-retry>重试写入与检索</button></details>`;
   }
 
   function applyLauncherPosition() {
@@ -1316,6 +1352,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
         toast(runtime.bridgeStatus, synced ? 'success' : 'info');
         return;
       }
+      if (target.hasAttribute('data-apb-oracle'))oracle.open();
       if (target.hasAttribute('data-apb-adapt-card')) {
         await ensureAnimaCardAdaptation({ manual: true });
         return;
@@ -1416,6 +1453,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     if (!source?.on) return;
     const types=context()?.event_types||{};
     source.on(types.CHAT_CHANGED||'chat_id_changed', () => {
+      runtime.reconcilePending=false;runtime.reconcilePendingReason='';runtime.reconcileScheduledReason='';
       document.getElementById('apb-action-dialog')?.close();
       document.getElementById('apb-retry-dialog')?.close();
       document.getElementById('apb-retry-dialog')?.remove();
@@ -1432,11 +1470,15 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
       scheduleReconcile('chat_changed', 700);
       scheduleAnimaCardAdaptation(1100);
     });
+    source.on(types.GENERATION_STARTED||'generation_started',()=>{runtime.generating=true;clearTimeout(runtime.reconcileTimer);});
+    source.on(types.GENERATION_STOPPED||'generation_stopped',()=>{runtime.generating=false;scheduleReconcile('assistant_message',1000);});
     source.on(types.GENERATION_ENDED||'generation_ended', () => {
+      runtime.generating=false;
       if (!runtime.phone) loadPhone();
       scheduleReconcile('assistant_message', 900);
       scheduleAnimaCardAdaptation(1200);
     });
+    for(const event of new Set([types.MESSAGE_RECEIVED||'message_received',types.CHARACTER_MESSAGE_RENDERED||'character_message_rendered',types.MESSAGE_SWIPED||'message_swiped']))source.on(event,()=>scheduleReconcile('assistant_message',1100));
     source.on(types.GENERATION_AFTER_COMMANDS||'generation_after_commands',prepareMemory);
   }
 
@@ -1459,7 +1501,7 @@ import {rosterPrompt,verifiedRoster,applyRoster} from './roster.mjs';
     bridgeToAnima('startup');
     syncContactRoster().then(() => { render(); renderBackstage(); }).catch(() => {});
     scheduleAnimaCardAdaptation(1100);
-    console.info('[Anima Phone Bridge] v0.4.0 ready');
+    console.info('[Anima Phone Bridge] v0.6.0 ready');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, { once: true });

@@ -21,7 +21,7 @@ export function mergeScene(previous, scene, floor) {
     const identity=r=>r.id||r.name||r.subject||r.title||r.content||JSON.stringify(r);
     next[key]=[...new Map([...old[key],...next[key]].map(r=>[identity(r),r])).values()];
   }
-  next.offscreen=next.offscreen.filter(r=>!next.present.some(p=>p.name===r.name));
+  next.offscreen=next.offscreen.filter(r=>r.name&&!next.present.some(p=>p.name===r.name));
   next.updatedAt=Date.now();next.sourceFloor=floor;
   return next;
 }

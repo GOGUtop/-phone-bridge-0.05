@@ -1,3 +1,7 @@
+Scope notice: The following MIT license applies to this project's own code.
+It does not license the transplanted Story Oracle material under oracle/.
+That material is attributed and its authorization is recorded in oracle/NOTICE.md.
+
 MIT License
 
 Copyright (c) 2026 Anima Phone Bridge contributors
